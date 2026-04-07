@@ -1,8 +1,14 @@
-# claude-projects
+# cld
 
 Interactive TUI to browse and resume Claude Code conversations across all projects on your machine.
 
-Unlike the built-in `/resume` command which only shows conversations for the current directory, `claude-projects` shows **all** projects and conversations.
+Unlike the built-in `/resume` command which only shows conversations for the current directory, `cld` shows **all** projects and conversations.
+
+Install via Homebrew:
+
+```sh
+brew install Leo6Leo/tap/cld
+```
 
 ## Features
 
@@ -17,15 +23,15 @@ Unlike the built-in `/resume` command which only shows conversations for the cur
 1. Copy the script somewhere on your PATH:
 
 ```sh
-cp claude-projects /usr/local/bin/
+cp cld /usr/local/bin/
 ```
 
 Or add a shell function to your `~/.zshrc` (recommended, enables cd-after-exit):
 
 ```sh
-claude-projects() {
+cld() {
   local tmpfile=$(mktemp)
-  CLAUDE_PROJECTS_CD_FILE="$tmpfile" /path/to/claude-projects "$@"
+  CLAUDE_PROJECTS_CD_FILE="$tmpfile" /path/to/cld "$@"
   if [[ -s "$tmpfile" ]]; then
     local dir=$(cat "$tmpfile")
     cd "$dir" 2>/dev/null
@@ -37,7 +43,7 @@ claude-projects() {
 2. Run it:
 
 ```sh
-claude-projects
+cld
 ```
 
 ## Usage
@@ -45,7 +51,7 @@ claude-projects
 ### Interactive (default)
 
 ```sh
-claude-projects
+cld
 ```
 
 | Key | Action |
@@ -63,10 +69,10 @@ claude-projects
 ### Non-interactive
 
 ```sh
-claude-projects --list              # Table view
-claude-projects --list -c           # With conversation details
-claude-projects --list -r           # Recent conversations (flat)
-claude-projects --list TERM         # Filter by keyword
+cld --list              # Table view
+cld --list -c           # With conversation details
+cld --list -r           # Recent conversations (flat)
+cld --list TERM         # Filter by keyword
 ```
 
 ## Requirements

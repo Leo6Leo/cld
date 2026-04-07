@@ -605,13 +605,13 @@ def non_interactive_mode():
 
 
 def print_help():
-    print("""claude-projects - Browse and resume Claude Code conversations
+    print("""cld - Browse and resume Claude Code conversations
 
 Usage:
-  claude-projects                Interactive TUI mode
-  claude-projects --list [-c]    Non-interactive table (add -c for conversations)
-  claude-projects --list -r      Non-interactive recent view
-  claude-projects --list TERM    Filter by keyword
+  cld                Interactive TUI mode
+  cld --list [-c]    Non-interactive table (add -c for conversations)
+  cld --list -r      Non-interactive recent view
+  cld --list TERM    Filter by keyword
 
 Interactive controls:
   ↑/↓ or j/k    Navigate
