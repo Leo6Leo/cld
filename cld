@@ -66,10 +66,11 @@ def shorten_path(path):
 
 
 def get_conversation_meta(filepath):
-    """Extract first user message and session name in a single pass.
+    """Extract first user message, session name, and cwd in a single pass.
     Only reads the first 50 lines to avoid scanning huge files."""
     first_message = None
     session_name = None
+    cwd = None
     try:
         with open(filepath, "r") as f:
             for i, line in enumerate(f):
@@ -85,32 +86,36 @@ def get_conversation_meta(filepath):
                     if entry_type == "session-name" and session_name is None:
                         session_name = entry.get("name", "")
 
-                    if entry_type == "user" and first_message is None and "message" in entry:
-                        content = entry["message"].get("content", "")
-                        if isinstance(content, str):
-                            text = content
-                        elif isinstance(content, list):
-                            text = ""
-                            for part in content:
-                                if isinstance(part, dict) and part.get("type") == "text":
-                                    text = part.get("text", "")
-                                    break
-                        else:
-                            continue
-                        text = text.replace("\n", " ").strip()
-                        for prefix in ["<local-command-caveat>", "<command-message>"]:
-                            if text.startswith(prefix):
-                                text = "(command)"
-                                break
-                        first_message = text
+                    if entry_type == "user" and "message" in entry:
+                        if cwd is None and entry.get("cwd"):
+                            cwd = entry["cwd"]
 
-                    if first_message is not None and session_name is not None:
+                        if first_message is None:
+                            content = entry["message"].get("content", "")
+                            if isinstance(content, str):
+                                text = content
+                            elif isinstance(content, list):
+                                text = ""
+                                for part in content:
+                                    if isinstance(part, dict) and part.get("type") == "text":
+                                        text = part.get("text", "")
+                                        break
+                            else:
+                                continue
+                            text = text.replace("\n", " ").strip()
+                            for prefix in ["<local-command-caveat>", "<command-message>"]:
+                                if text.startswith(prefix):
+                                    text = "(command)"
+                                    break
+                            first_message = text
+
+                    if first_message is not None and session_name is not None and cwd is not None:
                         break
                 except json.JSONDecodeError:
                     continue
     except Exception:
         pass
-    return first_message or "(empty)", session_name
+    return first_message or "(empty)", session_name, cwd
 
 
 def format_size(size_bytes):
@@ -153,26 +158,35 @@ def load_all_data():
         if not project_dir.is_dir():
             continue
 
-        project_path = decode_project_path(project_dir.name)
         convos = list(project_dir.glob("*.jsonl"))
         if not convos:
             continue
 
+        # Resolve project path from conversation cwd (ground truth),
+        # falling back to directory name decoding
+        project_path = None
         convo_infos = []
         for c in convos:
             mod_time = os.path.getmtime(c)
             session_id = c.stem
-            first_msg, name = get_conversation_meta(c)
+            first_msg, name, cwd = get_conversation_meta(c)
+            if cwd and project_path is None:
+                project_path = cwd
             info = {
                 "session_id": session_id,
                 "name": name,
                 "last_active": datetime.fromtimestamp(mod_time),
                 "size": c.stat().st_size,
                 "first_message": first_msg,
-                "project_path": project_path,
-                "display_path": shorten_path(project_path),
             }
             convo_infos.append(info)
+
+        if project_path is None:
+            project_path = decode_project_path(project_dir.name)
+
+        for info in convo_infos:
+            info["project_path"] = project_path
+            info["display_path"] = shorten_path(project_path)
             all_conversations.append(info)
 
         convo_infos.sort(key=lambda x: x["last_active"], reverse=True)
