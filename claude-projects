@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""Interactive TUI to browse and resume Claude Code conversations across all projects."""
+
+import curses
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+PREFS_FILE = Path.home() / ".claude" / "scripts" / ".list-projects-prefs.json"
+
+
+def load_prefs():
+    try:
+        with open(PREFS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {"view_mode": "projects"}
+
+
+def save_prefs(prefs):
+    try:
+        with open(PREFS_FILE, "w") as f:
+            json.dump(prefs, f)
+    except Exception:
+        pass
+
+
+def decode_project_path(dirname):
+    """Convert directory name back to the original path.
+    The encoding replaces '/' with '-', but directory names can also contain
+    literal hyphens. We resolve ambiguity by checking which paths exist."""
+    # Strip leading '-' which represents root '/'
+    parts = dirname[1:].split("-")
+
+    # Try to reconstruct the path by greedily finding existing directories
+    # Start from root and try to match the longest existing path segment
+    def resolve(idx, current_path):
+        if idx >= len(parts):
+            return current_path
+
+        # Try joining progressively more parts with hyphens
+        for end in range(len(parts), idx, -1):
+            segment = "-".join(parts[idx:end])
+            candidate = current_path + "/" + segment
+            if os.path.isdir(candidate) or end == idx + 1:
+                result = resolve(end, candidate)
+                if result and (os.path.isdir(result) or end >= len(parts)):
+                    return result
+
+        return None
+
+    result = resolve(0, "")
+    # Fallback to naive replacement if resolution fails
+    return result if result else "/" + dirname[1:].replace("-", "/")
+
+
+def shorten_path(path):
+    home = str(Path.home())
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
+def get_conversation_meta(filepath):
+    """Extract first user message and session name in a single pass.
+    Only reads the first 50 lines to avoid scanning huge files."""
+    first_message = None
+    session_name = None
+    try:
+        with open(filepath, "r") as f:
+            for i, line in enumerate(f):
+                if i >= 50:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    entry_type = entry.get("type")
+
+                    if entry_type == "session-name" and session_name is None:
+                        session_name = entry.get("name", "")
+
+                    if entry_type == "user" and first_message is None and "message" in entry:
+                        content = entry["message"].get("content", "")
+                        if isinstance(content, str):
+                            text = content
+                        elif isinstance(content, list):
+                            text = ""
+                            for part in content:
+                                if isinstance(part, dict) and part.get("type") == "text":
+                                    text = part.get("text", "")
+                                    break
+                        else:
+                            continue
+                        text = text.replace("\n", " ").strip()
+                        for prefix in ["<local-command-caveat>", "<command-message>"]:
+                            if text.startswith(prefix):
+                                text = "(command)"
+                                break
+                        first_message = text
+
+                    if first_message is not None and session_name is not None:
+                        break
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return first_message or "(empty)", session_name
+
+
+def format_size(size_bytes):
+    if size_bytes < 1024:
+        return f"{size_bytes}B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes // 1024}KB"
+    else:
+        return f"{size_bytes // (1024 * 1024)}MB"
+
+
+def format_relative_time(dt):
+    now = datetime.now()
+    delta = now - dt
+    seconds = int(delta.total_seconds())
+    if seconds < 60:
+        return "just now"
+    elif seconds < 3600:
+        m = seconds // 60
+        return f"{m}m ago"
+    elif seconds < 86400:
+        h = seconds // 3600
+        return f"{h}h ago"
+    elif seconds < 604800:
+        d = seconds // 86400
+        return f"{d}d ago"
+    else:
+        return dt.strftime("%Y-%m-%d")
+
+
+def load_all_data():
+    """Load all projects and conversations once."""
+    if not PROJECTS_DIR.exists():
+        return [], []
+
+    projects = []
+    all_conversations = []
+
+    for project_dir in sorted(PROJECTS_DIR.iterdir()):
+        if not project_dir.is_dir():
+            continue
+
+        project_path = decode_project_path(project_dir.name)
+        convos = list(project_dir.glob("*.jsonl"))
+        if not convos:
+            continue
+
+        convo_infos = []
+        for c in convos:
+            mod_time = os.path.getmtime(c)
+            session_id = c.stem
+            first_msg, name = get_conversation_meta(c)
+            info = {
+                "session_id": session_id,
+                "name": name,
+                "last_active": datetime.fromtimestamp(mod_time),
+                "size": c.stat().st_size,
+                "first_message": first_msg,
+                "project_path": project_path,
+                "display_path": shorten_path(project_path),
+            }
+            convo_infos.append(info)
+            all_conversations.append(info)
+
+        convo_infos.sort(key=lambda x: x["last_active"], reverse=True)
+
+        latest = convo_infos[0]["last_active"]
+        total_size = sum(c.stat().st_size for c in convos)
+
+        projects.append({
+            "path": project_path,
+            "display_path": shorten_path(project_path),
+            "dir_name": project_dir.name,
+            "count": len(convos),
+            "last_active": latest,
+            "total_size": total_size,
+            "conversations": convo_infos,
+            "expanded": False,
+        })
+
+    projects.sort(key=lambda x: x["last_active"], reverse=True)
+    all_conversations.sort(key=lambda x: x["last_active"], reverse=True)
+    return projects, all_conversations
+
+
+def filter_projects(projects, term):
+    """Filter projects in-memory."""
+    if not term:
+        return projects
+    t = term.lower()
+    filtered = []
+    for p in projects:
+        # Match against path or any conversation message
+        if t in p["path"].lower() or t in p["display_path"].lower():
+            filtered.append(p)
+            continue
+        # Check conversation content
+        for c in p["conversations"]:
+            label = c["name"] or c["first_message"]
+            if t in label.lower():
+                filtered.append(p)
+                break
+    return filtered
+
+
+def filter_conversations(conversations, term):
+    """Filter flat conversation list in-memory."""
+    if not term:
+        return conversations
+    t = term.lower()
+    return [c for c in conversations if
+            t in c["project_path"].lower() or
+            t in c["display_path"].lower() or
+            t in (c["name"] or "").lower() or
+            t in c["first_message"].lower()]
+
+
+def build_project_lines(projects):
+    """Build display lines for project view."""
+    lines = []
+    for pi, p in enumerate(projects):
+        lines.append({"type": "project", "project_idx": pi, "project": p})
+        if p["expanded"]:
+            for ci, c in enumerate(p["conversations"]):
+                lines.append({
+                    "type": "conversation",
+                    "project_idx": pi,
+                    "convo_idx": ci,
+                    "project": p,
+                    "convo": c,
+                })
+    return lines
+
+
+def build_recent_lines(conversations):
+    """Build display lines for recent view."""
+    return [{"type": "recent", "convo": c} for c in conversations]
+
+
+def draw_line(stdscr, row, w, line, is_selected, view_mode):
+    """Draw a single line."""
+    attr = curses.color_pair(1) | curses.A_BOLD if is_selected else 0
+
+    if line["type"] == "project":
+        p = line["project"]
+        arrow = "▼" if p["expanded"] else "▶"
+        time_str = format_relative_time(p["last_active"])
+        text = f" {arrow} {p['display_path']}  ({p['count']} convos, {format_size(p['total_size'])}, {time_str})"
+        if not is_selected:
+            attr = curses.color_pair(2) | curses.A_BOLD
+
+    elif line["type"] == "conversation":
+        c = line["convo"]
+        time_str = format_relative_time(c["last_active"])
+        size_str = format_size(c["size"])
+        label = c["name"] if c["name"] else c["first_message"]
+        max_msg = w - 32
+        if len(label) > max_msg:
+            label = label[:max_msg - 1] + "…"
+        text = f"     └─ {time_str:>10}  {size_str:>6}  {label}"
+        if not is_selected:
+            attr = curses.color_pair(3)
+
+    elif line["type"] == "recent":
+        c = line["convo"]
+        time_str = format_relative_time(c["last_active"])
+        size_str = format_size(c["size"])
+        label = c["name"] if c["name"] else c["first_message"]
+        project_short = c["display_path"]
+        # Budget: time(10) + size(6) + project + label + padding
+        max_proj = min(30, len(project_short))
+        project_display = project_short[:max_proj]
+        max_msg = w - max_proj - 28
+        if max_msg < 10:
+            max_msg = 10
+        if len(label) > max_msg:
+            label = label[:max_msg - 1] + "…"
+        text = f" {time_str:>10}  {size_str:>6}  {project_display}  {label}"
+        if not is_selected:
+            attr = curses.color_pair(3)
+
+    try:
+        stdscr.addnstr(row, 0, text.ljust(w), w - 1, attr)
+    except curses.error:
+        pass
+
+
+def run_tui(stdscr, all_projects, all_conversations):
+    """Main TUI loop."""
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.set_escdelay(25)
+    curses.curs_set(0)
+    curses.use_default_colors()
+
+    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)    # selected
+    curses.init_pair(2, curses.COLOR_CYAN, -1)                     # project
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)                   # conversation
+    curses.init_pair(4, curses.COLOR_GREEN, -1)                    # info
+    curses.init_pair(5, curses.COLOR_WHITE, -1)                    # dim
+    curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_GREEN)    # status bar
+    curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_YELLOW)   # mode tab active
+    curses.init_pair(8, curses.COLOR_WHITE, -1)                    # mode tab inactive
+
+    prefs = load_prefs()
+    view_mode = prefs.get("view_mode", "projects")  # "projects" or "recent"
+
+    cursor = 0
+    scroll_offset = 0
+    filter_text = ""
+    filtering = False
+    message = ""
+
+    # Filtered data (computed from cached data, no re-reading files)
+    filtered_projects = list(all_projects)
+    filtered_conversations = list(all_conversations)
+
+    # Reset expanded state
+    for p in all_projects:
+        p["expanded"] = False
+
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+
+        # Row 0: Mode tabs
+        tab_projects = " [1] Projects "
+        tab_recent = " [2] Recent "
+        x = 1
+        if view_mode == "projects":
+            stdscr.addnstr(0, x, tab_projects, w - 1, curses.color_pair(7) | curses.A_BOLD)
+            x += len(tab_projects) + 1
+            stdscr.addnstr(0, x, tab_recent, w - 1, curses.color_pair(8))
+        else:
+            stdscr.addnstr(0, x, tab_projects, w - 1, curses.color_pair(8))
+            x += len(tab_projects) + 1
+            stdscr.addnstr(0, x, tab_recent, w - 1, curses.color_pair(7) | curses.A_BOLD)
+
+        # Row 1: Filter bar
+        if filtering:
+            filter_line = f" /{filter_text}█"
+        elif filter_text:
+            filter_line = f" /{filter_text}"
+        else:
+            filter_line = ""
+        if filter_line:
+            stdscr.addnstr(1, 0, filter_line, w - 1, curses.color_pair(4))
+
+        # Build lines based on view mode
+        if view_mode == "projects":
+            lines = build_project_lines(filtered_projects)
+        else:
+            lines = build_recent_lines(filtered_conversations)
+
+        content_start = 2 if not filter_line else 2
+        content_start = 2
+
+        if not lines:
+            msg = "No results." if filter_text else "No conversations found."
+            stdscr.addnstr(content_start + 1, 2, msg, w - 3)
+        else:
+            if cursor >= len(lines):
+                cursor = len(lines) - 1
+            if cursor < 0:
+                cursor = 0
+
+            visible_h = h - content_start - 2  # status + help
+            if visible_h < 1:
+                visible_h = 1
+
+            if cursor < scroll_offset:
+                scroll_offset = cursor
+            if cursor >= scroll_offset + visible_h:
+                scroll_offset = cursor - visible_h + 1
+
+            for i in range(visible_h):
+                li = scroll_offset + i
+                if li >= len(lines):
+                    break
+                row = content_start + i
+                draw_line(stdscr, row, w, lines[li], li == cursor, view_mode)
+
+        # Status bar
+        status_row = h - 2
+        if view_mode == "projects":
+            total_p = len(filtered_projects)
+            total_c = sum(p["count"] for p in filtered_projects)
+            status = f" {total_p} projects, {total_c} conversations"
+        else:
+            status = f" {len(filtered_conversations)} conversations"
+        try:
+            stdscr.addnstr(status_row, 0, status.ljust(w), w - 1, curses.color_pair(6))
+        except curses.error:
+            pass
+
+        # Help line
+        help_row = h - 1
+        if message:
+            help_text = f" {message}"
+        elif filtering:
+            help_text = " Type to filter | Enter:confirm  Esc:clear  Backspace:delete"
+        else:
+            if filter_text:
+                help_text = " ↑↓/jk:move  Enter:open  /:edit filter  Esc:clear filter  q:quit"
+            else:
+                help_text = " ↑↓/jk:move  Enter:open  /:filter  1/2:view  Esc/q:quit"
+        try:
+            stdscr.addnstr(help_row, 0, help_text.ljust(w), w - 1, curses.color_pair(5))
+        except curses.error:
+            pass
+
+        stdscr.refresh()
+        key = stdscr.getch()
+        message = ""
+
+        # Filter input mode
+        if filtering:
+            if key == 27:  # Escape — exit filter mode, keep filter text
+                filtering = False
+            elif key in (curses.KEY_ENTER, 10, 13):
+                filtering = False
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                if filter_text:
+                    filter_text = filter_text[:-1]
+                    filtered_projects = filter_projects(all_projects, filter_text)
+                    filtered_conversations = filter_conversations(all_conversations, filter_text)
+                    cursor = 0
+                    scroll_offset = 0
+                else:
+                    # Backspace on empty filter exits filter mode
+                    filtering = False
+            elif 32 <= key <= 126:
+                filter_text += chr(key)
+                filtered_projects = filter_projects(all_projects, filter_text)
+                filtered_conversations = filter_conversations(all_conversations, filter_text)
+                cursor = 0
+                scroll_offset = 0
+            continue
+
+        if key == 27:  # Escape
+            if filter_text:
+                # First Esc clears the active filter and collapses all
+                filter_text = ""
+                for p in all_projects:
+                    p["expanded"] = False
+                filtered_projects = list(all_projects)
+                filtered_conversations = list(all_conversations)
+                cursor = 0
+                scroll_offset = 0
+            else:
+                # Second Esc (no filter active) quits
+                return None
+
+        elif key == ord("q"):
+            return None
+
+        elif key == ord("/"):
+            filtering = True
+
+        elif key == ord("1"):
+            if view_mode != "projects":
+                view_mode = "projects"
+                cursor = 0
+                scroll_offset = 0
+                prefs["view_mode"] = view_mode
+                save_prefs(prefs)
+
+        elif key == ord("2"):
+            if view_mode != "recent":
+                view_mode = "recent"
+                cursor = 0
+                scroll_offset = 0
+                prefs["view_mode"] = view_mode
+                save_prefs(prefs)
+
+        elif key == 9:  # Tab
+            view_mode = "recent" if view_mode == "projects" else "projects"
+            cursor = 0
+            scroll_offset = 0
+            prefs["view_mode"] = view_mode
+            save_prefs(prefs)
+
+        elif key == curses.KEY_UP or key == ord("k"):
+            cursor = max(0, cursor - 1)
+
+        elif key == curses.KEY_DOWN or key == ord("j"):
+            if lines:
+                cursor = min(len(lines) - 1, cursor + 1)
+
+        elif key == curses.KEY_PPAGE:
+            cursor = max(0, cursor - (h - 4))
+
+        elif key == curses.KEY_NPAGE:
+            if lines:
+                cursor = min(len(lines) - 1, cursor + (h - 4))
+
+        elif key == ord("g"):
+            cursor = 0
+            scroll_offset = 0
+
+        elif key == ord("G"):
+            if lines:
+                cursor = len(lines) - 1
+
+        elif key in (curses.KEY_ENTER, 10, 13):
+            if not lines:
+                continue
+            line = lines[cursor]
+
+            if line["type"] == "project":
+                line["project"]["expanded"] = not line["project"]["expanded"]
+
+            elif line["type"] == "conversation":
+                return {
+                    "project_path": line["project"]["path"],
+                    "session_id": line["convo"]["session_id"],
+                }
+
+            elif line["type"] == "recent":
+                return {
+                    "project_path": line["convo"]["project_path"],
+                    "session_id": line["convo"]["session_id"],
+                }
+
+        elif key == ord(" "):
+            if not lines:
+                continue
+            line = lines[cursor]
+            if line["type"] == "project":
+                line["project"]["expanded"] = not line["project"]["expanded"]
+            elif line["type"] in ("conversation", "recent"):
+                c = line.get("convo") or line.get("convo")
+                message = f"Session: {c['session_id']}"
+
+
+def non_interactive_mode():
+    """Fallback non-interactive mode."""
+    filter_term = None
+    show_convos = False
+    recent_mode = False
+    for arg in sys.argv[1:]:
+        if arg in ("-c", "--conversations"):
+            show_convos = True
+        elif arg in ("-r", "--recent"):
+            recent_mode = True
+        elif arg in ("-h", "--help"):
+            print_help()
+            return
+        elif not arg.startswith("-"):
+            filter_term = arg.lower()
+
+    projects, all_convos = load_all_data()
+
+    if recent_mode:
+        convos = filter_conversations(all_convos, filter_term) if filter_term else all_convos
+        if not convos:
+            print("No conversations found.")
+            return
+        print(f"\n{'Last Active':>12} {'Size':>8}  {'Project':<30} {'First Message'}")
+        print("─" * 100)
+        for c in convos:
+            date_str = c["last_active"].strftime("%Y-%m-%d")
+            label = c["name"] if c["name"] else c["first_message"]
+            if len(label) > 50:
+                label = label[:49] + "…"
+            print(f"{date_str:>12} {format_size(c['size']):>8}  {c['display_path']:<30} {label}")
+        print("─" * 100)
+        print(f"Total: {len(convos)} conversations\n")
+        return
+
+    filtered = filter_projects(projects, filter_term) if filter_term else projects
+    if not filtered:
+        print("No projects found." + (f" (filter: {filter_term})" if filter_term else ""))
+        return
+
+    print(f"\n{'Project Path':<60} {'Convos':>6} {'Size':>8} {'Last Active':>12}")
+    print("─" * 90)
+    for p in filtered:
+        date_str = p["last_active"].strftime("%Y-%m-%d")
+        print(f"{p['display_path']:<60} {p['count']:>6} {format_size(p['total_size']):>8} {date_str:>12}")
+        if show_convos:
+            for c in p["conversations"]:
+                date_str = c["last_active"].strftime("%Y-%m-%d %H:%M")
+                label = c["name"] if c["name"] else c["first_message"]
+                if len(label) > 70:
+                    label = label[:69] + "…"
+                print(f"    └─ {date_str}  {format_size(c['size']):>6}  {label}")
+
+    print("─" * 90)
+    total_c = sum(p["count"] for p in filtered)
+    total_s = sum(p["total_size"] for p in filtered)
+    print(f"{'Total: ' + str(len(filtered)) + ' projects':<60} {total_c:>6} {format_size(total_s):>8}\n")
+
+
+def print_help():
+    print("""claude-projects - Browse and resume Claude Code conversations
+
+Usage:
+  claude-projects                Interactive TUI mode
+  claude-projects --list [-c]    Non-interactive table (add -c for conversations)
+  claude-projects --list -r      Non-interactive recent view
+  claude-projects --list TERM    Filter by keyword
+
+Interactive controls:
+  ↑/↓ or j/k    Navigate
+  Enter          Expand project / Resume conversation
+  Space          Expand / Show session ID
+  /              Filter (instant, searches projects & messages)
+  1 or 2 or Tab  Switch view: [1] Projects  [2] Recent
+  g / G          Jump to top / bottom
+  PgUp / PgDn    Page up / down
+  q / Esc        Quit
+
+View mode is remembered between sessions.""")
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print_help()
+        return
+
+    if "--list" in sys.argv or "-l" in sys.argv:
+        sys.argv = [a for a in sys.argv if a not in ("--list", "-l")]
+        non_interactive_mode()
+        return
+
+    if not sys.stdout.isatty():
+        non_interactive_mode()
+        return
+
+    all_projects, all_conversations = load_all_data()
+    result = curses.wrapper(run_tui, all_projects, all_conversations)
+
+    if result:
+        project_path = result["project_path"]
+        session_id = result["session_id"]
+
+        # If invoked via the shell wrapper (CLAUDE_PROJECTS_CD=1),
+        # write the cd path to a temp file so the wrapper can cd after exit.
+        cd_file = os.environ.get("CLAUDE_PROJECTS_CD_FILE")
+        if cd_file:
+            with open(cd_file, "w") as f:
+                f.write(project_path)
+
+        print(f"\nResuming session {session_id}")
+        print(f"Project: {project_path}\n")
+        os.chdir(project_path)
+        os.execvp("claude", ["claude", "--resume", session_id])
+
+
+if __name__ == "__main__":
+    main()
