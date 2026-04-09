@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -144,6 +145,90 @@ def format_relative_time(dt):
         return f"{d}d ago"
     else:
         return dt.strftime("%Y-%m-%d")
+
+
+class SearchIndex:
+    """Background full-text index of all user messages."""
+
+    def __init__(self):
+        self.index = {}  # session_id -> list of message strings
+        self.ready = False
+        self.progress = 0  # files indexed so far
+        self.total = 0     # total files to index
+        self._lock = threading.Lock()
+
+    def build(self):
+        """Scan all conversation files and extract user messages."""
+        if not PROJECTS_DIR.exists():
+            self.ready = True
+            return
+
+        files = []
+        for project_dir in PROJECTS_DIR.iterdir():
+            if project_dir.is_dir():
+                files.extend(project_dir.glob("*.jsonl"))
+
+        self.total = len(files)
+
+        for filepath in files:
+            session_id = filepath.stem
+            messages = []
+            try:
+                with open(filepath, "r") as f:
+                    for line in f:
+                        # Fast pre-filter: skip lines that can't be user messages
+                        if '"user"' not in line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("type") != "user" or "message" not in entry:
+                                continue
+                            content = entry["message"].get("content", "")
+                            if isinstance(content, str):
+                                text = content
+                            elif isinstance(content, list):
+                                text = " ".join(
+                                    p.get("text", "")
+                                    for p in content
+                                    if isinstance(p, dict) and p.get("type") == "text"
+                                )
+                            else:
+                                continue
+                            text = text.strip()
+                            if text:
+                                # Cap per-message length to save memory
+                                messages.append(text[:500])
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            except Exception:
+                pass
+
+            if messages:
+                with self._lock:
+                    self.index[session_id] = messages
+
+            self.progress += 1
+
+        self.ready = True
+
+    def search(self, term):
+        """Return set of session_ids that match the search term."""
+        t = term.lower()
+        results = {}  # session_id -> first matching snippet
+        with self._lock:
+            for session_id, messages in self.index.items():
+                for msg in messages:
+                    if t in msg.lower():
+                        # Extract a snippet around the match
+                        lower_msg = msg.lower()
+                        pos = lower_msg.find(t)
+                        start = max(0, pos - 40)
+                        end = min(len(msg), pos + len(term) + 60)
+                        snippet = ("..." if start > 0 else "") + msg[start:end] + ("..." if end < len(msg) else "")
+                        snippet = snippet.replace("\n", " ")
+                        results[session_id] = snippet
+                        break
+        return results
 
 
 def load_all_data():
@@ -306,13 +391,29 @@ def draw_line(stdscr, row, w, line, is_selected, view_mode):
         if not is_selected:
             attr = curses.color_pair(3)
 
+    elif line["type"] == "search_result":
+        c = line["convo"]
+        snippet = line["snippet"]
+        time_str = format_relative_time(c["last_active"])
+        project_short = c["display_path"]
+        max_proj = min(25, len(project_short))
+        project_display = project_short[:max_proj]
+        max_snip = w - max_proj - 18
+        if max_snip < 10:
+            max_snip = 10
+        if len(snippet) > max_snip:
+            snippet = snippet[:max_snip - 1] + "…"
+        text = f" {time_str:>10}  {project_display}  {snippet}"
+        if not is_selected:
+            attr = curses.color_pair(9)
+
     try:
         stdscr.addnstr(row, 0, text.ljust(w), w - 1, attr)
     except curses.error:
         pass
 
 
-def run_tui(stdscr, all_projects, all_conversations):
+def run_tui(stdscr, all_projects, all_conversations, search_index):
     """Main TUI loop."""
     os.environ.setdefault("ESCDELAY", "25")
     curses.set_escdelay(25)
@@ -327,6 +428,7 @@ def run_tui(stdscr, all_projects, all_conversations):
     curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_GREEN)    # status bar
     curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_YELLOW)   # mode tab active
     curses.init_pair(8, curses.COLOR_WHITE, -1)                    # mode tab inactive
+    curses.init_pair(9, curses.COLOR_MAGENTA, -1)                  # deep search result
 
     prefs = load_prefs()
     view_mode = prefs.get("view_mode", "projects")  # "projects" or "recent"
@@ -334,12 +436,18 @@ def run_tui(stdscr, all_projects, all_conversations):
     cursor = 0
     scroll_offset = 0
     filter_text = ""
-    filtering = False
+    filtering = False      # quick filter mode (/)
+    deep_filtering = False  # deep search mode (?)
+    deep_search_text = ""
+    deep_search_results = []  # list of {"convo": ..., "snippet": ...}
     message = ""
 
     # Filtered data (computed from cached data, no re-reading files)
     filtered_projects = list(all_projects)
     filtered_conversations = list(all_conversations)
+
+    # Conversation lookup by session_id for deep search
+    convo_by_session = {c["session_id"]: c for c in all_conversations}
 
     # Reset expanded state
     for p in all_projects:
@@ -362,8 +470,15 @@ def run_tui(stdscr, all_projects, all_conversations):
             x += len(tab_projects) + 1
             stdscr.addnstr(0, x, tab_recent, w - 1, curses.color_pair(7) | curses.A_BOLD)
 
-        # Row 1: Filter bar
-        if filtering:
+        # Row 1: Filter/search bar
+        if deep_filtering:
+            filter_line = f" ?{deep_search_text}█"
+            if not search_index.ready:
+                pct = int(search_index.progress / max(search_index.total, 1) * 100)
+                filter_line += f"  (indexing... {pct}%)"
+        elif deep_search_text:
+            filter_line = f" ?{deep_search_text}  ({len(deep_search_results)} results)"
+        elif filtering:
             filter_line = f" /{filter_text}█"
         elif filter_text:
             filter_line = f" /{filter_text}"
@@ -373,17 +488,32 @@ def run_tui(stdscr, all_projects, all_conversations):
             stdscr.addnstr(1, 0, filter_line, w - 1, curses.color_pair(4))
 
         # Build lines based on view mode
-        if view_mode == "projects":
+        if deep_search_text is not None and deep_search_text != "":
+            # In deep search mode — only show search results
+            if deep_search_results:
+                lines = [{"type": "search_result", "convo": r["convo"], "snippet": r["snippet"]}
+                         for r in deep_search_results]
+            else:
+                lines = []
+        elif view_mode == "projects":
             lines = build_project_lines(filtered_projects)
         else:
             lines = build_recent_lines(filtered_conversations)
 
-        content_start = 2 if not filter_line else 2
         content_start = 2
 
         if not lines:
-            msg = "No results." if filter_text else "No conversations found."
-            stdscr.addnstr(content_start + 1, 2, msg, w - 3)
+            if deep_search_text:
+                if not search_index.ready:
+                    pct = int(search_index.progress / max(search_index.total, 1) * 100)
+                    msg = f"  Indexing in progress... {pct}%"
+                else:
+                    msg = f'  No results found for "{deep_search_text}"'
+            elif filter_text:
+                msg = "  No results."
+            else:
+                msg = "  No conversations found."
+            stdscr.addnstr(content_start + 1, 0, msg, w - 1, curses.color_pair(5))
         else:
             if cursor >= len(lines):
                 cursor = len(lines) - 1
@@ -408,7 +538,12 @@ def run_tui(stdscr, all_projects, all_conversations):
 
         # Status bar
         status_row = h - 2
-        if view_mode == "projects":
+        if deep_search_text:
+            status = f" {len(deep_search_results)} matches"
+            if not search_index.ready:
+                pct = int(search_index.progress / max(search_index.total, 1) * 100)
+                status += f"  (indexing {pct}%)"
+        elif view_mode == "projects":
             total_p = len(filtered_projects)
             total_c = sum(p["count"] for p in filtered_projects)
             status = f" {total_p} projects, {total_c} conversations"
@@ -423,23 +558,77 @@ def run_tui(stdscr, all_projects, all_conversations):
         help_row = h - 1
         if message:
             help_text = f" {message}"
+        elif deep_filtering:
+            help_text = " Deep search (all messages) | Enter:done  Esc:cancel"
+        elif deep_search_text:
+            help_text = " ↑↓/jk:move  Enter:resume  ?:edit  Esc:back  q:quit"
         elif filtering:
-            help_text = " Type to filter | Enter:confirm  Esc:clear  Backspace:delete"
+            help_text = " Quick filter (names only) | Enter:done  Esc:exit"
         else:
             if filter_text:
-                help_text = " ↑↓/jk:move  Enter:open  /:edit filter  Esc:clear filter  q:quit"
+                help_text = " ↑↓/jk:move  Enter:resume  /:edit  Esc:back  q:quit"
             else:
-                help_text = " ↑↓/jk:move  Enter:open  /:filter  1/2:view  Esc/q:quit"
+                help_text = " ↑↓/jk:move  Enter:open  /:filter  ?:deep search  1/2:view  q:quit"
         try:
             stdscr.addnstr(help_row, 0, help_text.ljust(w), w - 1, curses.color_pair(5))
         except curses.error:
             pass
 
         stdscr.refresh()
+
+        # Use a short timeout during indexing so progress updates render
+        if deep_filtering and not search_index.ready:
+            stdscr.timeout(200)
+        else:
+            stdscr.timeout(-1)
+
         key = stdscr.getch()
+        if key == -1:  # timeout, no input
+            continue
         message = ""
 
-        # Filter input mode
+        # Deep search input mode
+        if deep_filtering:
+            changed = False
+            if key == 27:  # Escape — cancel deep search
+                deep_filtering = False
+                deep_search_text = ""
+                deep_search_results = []
+                cursor = 0
+                scroll_offset = 0
+            elif key in (curses.KEY_ENTER, 10, 13):
+                deep_filtering = False
+            elif key in (curses.KEY_BACKSPACE, 127, 8):
+                if deep_search_text:
+                    deep_search_text = deep_search_text[:-1]
+                    changed = True
+                else:
+                    deep_filtering = False
+            elif 32 <= key <= 126:
+                deep_search_text += chr(key)
+                changed = True
+
+            # Live search as user types
+            if changed and deep_search_text and search_index.ready:
+                matches = search_index.search(deep_search_text)
+                deep_search_results = []
+                for sid, snippet in matches.items():
+                    if sid in convo_by_session:
+                        deep_search_results.append({
+                            "convo": convo_by_session[sid],
+                            "snippet": snippet,
+                        })
+                deep_search_results.sort(
+                    key=lambda r: r["convo"]["last_active"], reverse=True)
+                cursor = 0
+                scroll_offset = 0
+            elif changed and not deep_search_text:
+                deep_search_results = []
+                cursor = 0
+                scroll_offset = 0
+            continue
+
+        # Quick filter input mode
         if filtering:
             if key == 27:  # Escape — exit filter mode, keep filter text
                 filtering = False
@@ -464,7 +653,13 @@ def run_tui(stdscr, all_projects, all_conversations):
             continue
 
         if key == 27:  # Escape
-            if filter_text:
+            if deep_search_text:
+                # Clear deep search results and go back
+                deep_search_text = ""
+                deep_search_results = []
+                cursor = 0
+                scroll_offset = 0
+            elif filter_text:
                 # First Esc clears the active filter and collapses all
                 filter_text = ""
                 for p in all_projects:
@@ -482,6 +677,9 @@ def run_tui(stdscr, all_projects, all_conversations):
 
         elif key == ord("/"):
             filtering = True
+
+        elif key == ord("?"):
+            deep_filtering = True
 
         elif key == ord("1"):
             if view_mode != "projects":
@@ -542,7 +740,7 @@ def run_tui(stdscr, all_projects, all_conversations):
                     "session_id": line["convo"]["session_id"],
                 }
 
-            elif line["type"] == "recent":
+            elif line["type"] in ("recent", "search_result"):
                 return {
                     "project_path": line["convo"]["project_path"],
                     "session_id": line["convo"]["session_id"],
@@ -554,8 +752,8 @@ def run_tui(stdscr, all_projects, all_conversations):
             line = lines[cursor]
             if line["type"] == "project":
                 line["project"]["expanded"] = not line["project"]["expanded"]
-            elif line["type"] in ("conversation", "recent"):
-                c = line.get("convo") or line.get("convo")
+            elif line["type"] in ("conversation", "recent", "search_result"):
+                c = line.get("convo")
                 message = f"Session: {c['session_id']}"
 
 
@@ -631,7 +829,8 @@ Interactive controls:
   ↑/↓ or j/k    Navigate
   Enter          Expand project / Resume conversation
   Space          Expand / Show session ID
-  /              Filter (instant, searches projects & messages)
+  /              Quick filter (project names & first messages)
+  ?              Deep search (full-text across all messages)
   1 or 2 or Tab  Switch view: [1] Projects  [2] Recent
   g / G          Jump to top / bottom
   PgUp / PgDn    Page up / down
@@ -655,7 +854,13 @@ def main():
         return
 
     all_projects, all_conversations = load_all_data()
-    result = curses.wrapper(run_tui, all_projects, all_conversations)
+
+    # Start building full-text search index in background
+    search_index = SearchIndex()
+    index_thread = threading.Thread(target=search_index.build, daemon=True)
+    index_thread.start()
+
+    result = curses.wrapper(run_tui, all_projects, all_conversations, search_index)
 
     if result:
         project_path = result["project_path"]
