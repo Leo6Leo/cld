@@ -148,7 +148,7 @@ def format_relative_time(dt):
 
 
 class SearchIndex:
-    """Background full-text index of all user messages."""
+    """Background full-text index of all conversation messages."""
 
     def __init__(self):
         self.index = {}  # session_id -> list of message strings
@@ -157,8 +157,20 @@ class SearchIndex:
         self.total = 0     # total files to index
         self._lock = threading.Lock()
 
+    def _extract_text(self, content):
+        """Extract text from message content (string or content blocks)."""
+        if isinstance(content, str):
+            return content.strip()
+        elif isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict) and p.get("type") == "text":
+                    parts.append(p.get("text", ""))
+            return " ".join(parts).strip()
+        return ""
+
     def build(self):
-        """Scan all conversation files and extract user messages."""
+        """Scan all conversation files and index user + assistant messages."""
         if not PROJECTS_DIR.exists():
             self.ready = True
             return
@@ -176,27 +188,19 @@ class SearchIndex:
             try:
                 with open(filepath, "r") as f:
                     for line in f:
-                        # Fast pre-filter: skip lines that can't be user messages
-                        if '"user"' not in line:
+                        # Fast pre-filter: only parse lines that look like messages
+                        if '"message"' not in line:
                             continue
                         try:
                             entry = json.loads(line)
-                            if entry.get("type") != "user" or "message" not in entry:
+                            etype = entry.get("type")
+                            if etype not in ("user", "assistant"):
                                 continue
-                            content = entry["message"].get("content", "")
-                            if isinstance(content, str):
-                                text = content
-                            elif isinstance(content, list):
-                                text = " ".join(
-                                    p.get("text", "")
-                                    for p in content
-                                    if isinstance(p, dict) and p.get("type") == "text"
-                                )
-                            else:
+                            msg = entry.get("message")
+                            if not msg:
                                 continue
-                            text = text.strip()
+                            text = self._extract_text(msg.get("content", ""))
                             if text:
-                                # Cap per-message length to save memory
                                 messages.append(text[:500])
                         except (json.JSONDecodeError, KeyError):
                             continue
