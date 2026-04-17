@@ -62,7 +62,8 @@ Unlike the built-in `/resume` command which only shows conversations for the cur
 ### Homebrew (recommended)
 
 ```sh
-brew install Leo6Leo/tap/cld
+brew tap Leo6Leo/cld https://github.com/Leo6Leo/cld
+brew install cld
 ```
 
 ### Manual
